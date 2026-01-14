@@ -43,7 +43,7 @@ pip install -r requirements.txt
 Run the main script:
 
 ```bash
-python fake_review_analyzer.py
+python src/fake_review_analyzer.py
 ```
 
 Make sure any input data is in the `data/` folder.

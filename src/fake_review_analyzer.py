@@ -1,161 +1,182 @@
+"""
+Semantic Contradiction Detector
+Assignment - Part 2
+"""
 
-import re
+from typing import List, Tuple, Dict, Any
+from dataclasses import dataclass
 import numpy as np
-from collections import defaultdict
-from sklearn.cluster import KMeans
-from textblob import TextBlob
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import re
 import torch
 import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import json
 
-labels = ['contradiction', 'neutral', 'entailment']
 
-tokenizer = AutoTokenizer.from_pretrained('roberta-large-mnli')
-model = AutoModelForSequenceClassification.from_pretrained('roberta-large-mnli')
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model.to(device)
+@dataclass
+class ContradictionResult:
+    has_contradiction: bool
+    confidence: float
+    contradicting_pairs: List[Tuple[str, str]]
+    explanation: str
 
-def sent_tokenize(text):
-    return re.split(r'(?<=[.!?])\s+', text.strip())
 
-def find_sentences_for_span(span, text):
-    start, end = span
-    sentences = sent_tokenize(text)
-    selected = []
-    pos = 0
-    for s in sentences:
-        s_start = pos
-        s_end = pos + len(s)
-        if s_end >= start and s_start <= end:
-            selected.append(s)
-        pos += len(s) + 1
-    return " ".join(selected).strip()
+class SemanticContradictionDetector:
 
-def detect_contradiction(review_item):
-    if review_item.get('has_contradiction') and len(review_item.get('contradiction_spans', [])) == 2:
-        span1, span2 = review_item['contradiction_spans']
-        sent1 = find_sentences_for_span(span1, review_item['text'])
-        sent2 = find_sentences_for_span(span2, review_item['text'])
-        encoded = tokenizer(sent1, sent2, return_tensors='pt', truncation=True, max_length=512).to(device)
+    def __init__(self, model_name: str = "roberta-large-mnli"):
+        
+        self.model_name = model_name
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+
+        self.labels = ['contradiction', 'neutral', 'entailment']
+
+        # use gpu if available
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model.to(self.device)
+
+    # ----------------------------------------------------
+    # STEP 1 — Preprocessing
+    # ----------------------------------------------------
+    def preprocess(self, text: str) -> List[str]:
+        
+        # remove extra whitespace
+        text = text.strip()
+
+        # split on punctuation boundaries
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+
+        # return non-empty sentences
+        return [s for s in sentences if s.strip()]
+
+    # ----------------------------------------------------
+    # STEP 2 — Claim Extraction
+    # ----------------------------------------------------
+    def extract_claims(self, sentences: List[str]) -> List[Dict[str, Any]]:
+        
+        claims = []
+        for s in sentences:
+            claims.append({
+                "text": s,
+                "tokens": s.split(),
+                "length": len(s.split())
+            })
+        return claims
+
+    def check_contradiction(self, claim_a: Dict, claim_b: Dict) -> Tuple[bool, float]:
+
+        encoded = self.tokenizer(
+            claim_a["text"],
+            claim_b["text"],
+            return_tensors="pt",
+            truncation=True,
+            max_length=512
+        ).to(self.device)
+
         with torch.no_grad():
-            logits = model(**encoded).logits
+            logits = self.model(**encoded).logits
             probs = F.softmax(logits, dim=1)
-            predicted_label = labels[torch.argmax(probs)]
-            confidence = float(torch.max(probs))
-        return {'contradiction': predicted_label == 'contradiction', 'confidence': confidence, 
-                'evidence': (sent1, sent2)}
-    return {'contradiction': False, 'confidence': 0.0, 'evidence': None}
+
+        label_index = int(torch.argmax(probs))
+        label = self.labels[label_index]
+        confidence = float(torch.max(probs))
+
+        return (label == "contradiction", confidence)
+
+    # ----------------------------------------------------
+    # STEP 4 — Full Pipeline
+    # ----------------------------------------------------
+    def analyze(self, text: str) -> ContradictionResult:
+        
+        
+        sentences = self.preprocess(text)
+
+        
+        claims = self.extract_claims(sentences)
+
+        contradicting_pairs = []
+        confidences = []
+
+        
+        for i in range(len(claims)):
+            for j in range(i + 1, len(claims)):
+                is_contra, conf = self.check_contradiction(claims[i], claims[j])
+                if is_contra:
+                    contradicting_pairs.append((claims[i]["text"], claims[j]["text"]))
+                    confidences.append(conf)
+
+        if contradicting_pairs:
+            return ContradictionResult(
+                has_contradiction=True,
+                confidence=float(np.mean(confidences)),
+                contradicting_pairs=contradicting_pairs,
+                explanation="At least one sentence pair shows contradiction."
+            )
+
+        # otherwise no contradiction
+        return ContradictionResult(
+            has_contradiction=False,
+            confidence=0.0,
+            contradicting_pairs=[],
+            explanation="No contradictory claims detected."
+        )
 
 
-urgency_keywords = ["only", "hurry", "limited time", "buy now", "act fast"]
-scarcity_keywords = ["limited stock", "almost gone", "last chance"]
-emotional_keywords = ["everyone is buying", "you deserve", "must-have"]
 
-def detect_manipulation(text):
-    text_lower = text.lower()
-    urgency_found = any(k in text_lower for k in urgency_keywords)
-    scarcity_found = any(k in text_lower for k in scarcity_keywords)
-    emotional_found = any(k in text_lower for k in emotional_keywords)
-    sentiment = TextBlob(text).sentiment.polarity
-    sentiment_score = "positive" if sentiment > 0 else "negative" if sentiment < 0 else "neutral"
+def evaluate(detector: SemanticContradictionDetector,
+             test_data: List[Dict]) -> Dict[str, float]:
+    """
+    Evaluate detector performance.
+    """
 
-    score = 0
-    if urgency_found or scarcity_found:
-        score += 1
-    if emotional_found:
-        score += 1
-    if sentiment_score == "positive":
-        score += 0.5
-    is_manipulative = score > 1.5
-    evidence = []
-    if urgency_found: evidence.append("urgency")
-    if scarcity_found: evidence.append("scarcity")
-    if emotional_found: evidence.append("emotional")
-    return {'manipulative': is_manipulative, 'score': score, 'evidence': evidence}
+    y_true = []
+    y_pred = []
 
+    for sample in test_data:
+        result = detector.analyze(sample["text"])
 
-def extract_style_features(text):
-    words = text.split()
-    sentences = re.split(r'[.!?]', text)
-    sentences = [s for s in sentences if s.strip()]
-    avg_sentence_len = len(words)/max(len(sentences),1)
-    avg_word_len = np.mean([len(w) for w in words]) if words else 0
-    exclamations = text.count('!')
-    questions = text.count('?')
-    uppercase_ratio = sum(1 for c in text if c.isupper())/max(len(text),1)
-    vocab_richness = len(set(words))/max(len(words),1)
-    return [avg_sentence_len, avg_word_len, exclamations, questions, uppercase_ratio, vocab_richness]
+        # ground-truth labels expected in sample["label"]
+        y_true.append(sample.get("has_contradiction", False))
+        y_pred.append(result.has_contradiction)
 
-class StylometryDetector:
-    def cluster_reviews(self, texts, review_ids, n_clusters=3):
-        features = np.array([extract_style_features(t) for t in texts])
-        n_clusters = min(n_clusters, len(texts))  # Fix: cannot have more clusters than reviews
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-        labels = kmeans.fit_predict(features)
-        clusters = defaultdict(list)
-        for idx,label in enumerate(labels):
-            clusters[label].append({'id': review_ids[idx], 'text': texts[idx]})
-        return clusters
+    y_true = np.array(y_true, dtype=bool)
+    y_pred = np.array(y_pred, dtype=bool)
+
+    accuracy = float(np.mean(y_true == y_pred))
+    tp = np.sum(y_true & y_pred)
+    precision = float(tp / (np.sum(y_pred) + 1e-8))
+    recall = float(tp / (np.sum(y_true) + 1e-8))
+    f1 = float(2 * precision * recall / (precision + recall + 1e-8))
+
+    return dict(
+        accuracy=accuracy,
+        precision=precision,
+        recall=recall,
+        f1=f1
+    )
 
 
-def decide_review(contradiction, manipulation, stylometry_match):
-    signals = 0
-    evidence = []
+if __name__ == "__main__":
+    detector = SemanticContradictionDetector()
 
-    if contradiction['contradiction']:
-        signals += 1
-        evidence.append("Contradiction")
-    if manipulation['manipulative']:
-        signals += 1
-        evidence.append("Manipulation")
-    if stylometry_match:
-        signals += 1
-        evidence.append("Fingerprint")
+    with open(r'data\dataset.txt', 'r', encoding='utf-8') as f:
+        raw_json = f.read()
 
-    if signals == 0:
-        label = "Real"
-        confidence = 0.0
-    else:
-        label = "Fake" if signals > 1 else "Suspicious"
-        confidence = signals / 3
-    return label, confidence, evidence if evidence else None
+    corrected_json = re.sub(r'\((\d+,\s*\d+)\)', r'[\1]', raw_json)
+    corrected_json = corrected_json.replace('True', 'true').replace('False', 'false')
 
+    data = json.loads(corrected_json)
+    
 
-def analyze_all_reviews(reviews):
-    results = []
-    stylo = StylometryDetector()
-    texts = [r['text'] for r in reviews]
-    review_ids = [r['id'] for r in reviews]
-    clusters = stylo.cluster_reviews(texts, review_ids)
+    for review in data:
+        result = detector.analyze(review["text"])
+        print(f"\nReview {review.get('id', 'N/A')}")
+        print(f"Text: {review['text']}")
+        print(f"Has contradiction: {result.has_contradiction}")
+        print(f"Confidence: {result.confidence}")
+        print(f"Contradicting pairs: {result.contradicting_pairs}")
+        print(f"Explanation: {result.explanation}")
 
-    for idx, r in enumerate(reviews):
-        contradiction = detect_contradiction(r)
-        manipulation = detect_manipulation(r['text'])
-        # If review shares cluster with others (>1 review in cluster)
-        cluster_label = None
-        for label,revs in clusters.items():
-            if any(rv['id']==r['id'] for rv in revs):
-                cluster_label = label
-                break
-        stylometry_match = len(clusters[cluster_label]) > 1 if cluster_label is not None else False
-
-        label, confidence, evidence = decide_review(contradiction, manipulation, stylometry_match)
-        results.append({'id': r['id'], 'deceptive': label=="Fake", 'confidence': confidence, 'evidence': evidence})
-    return results
-
-# -------------------- Evaluation --------------------
-def evaluate_reviews(results, ground_truth):
-    y_true = [r.get('deceptive',False) for r in ground_truth]
-    y_pred = [r['deceptive'] for r in results]
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
-    accuracy = float(np.mean(y_true==y_pred))
-    precision = float(np.sum((y_true & y_pred))/(np.sum(y_pred)+1e-8))
-    recall = float(np.sum((y_true & y_pred))/(np.sum(y_true)+1e-8))
-    f1 = float(2*precision*recall/(precision+recall+1e-8))
-    return {'accuracy': accuracy,'precision': precision,'recall': recall,'f1': f1}
-
-
-if __name__=="__main__":
-    print("This module is ready to run on any list of reviews with keys 'id' and 'text'.")
-    print("Use 'analyze_all_reviews(reviews)' to process reviews and 'evaluate_reviews(results, ground_truth)' for metrics.")
+    metrics = evaluate(detector, data)
+    print("\nMetrics:", metrics)
