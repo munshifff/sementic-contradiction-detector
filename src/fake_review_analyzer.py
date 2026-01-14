@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import json
 
-
 @dataclass
 class ContradictionResult:
     has_contradiction: bool
@@ -36,23 +35,19 @@ class SemanticContradictionDetector:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model.to(self.device)
 
-    # ----------------------------------------------------
-    # STEP 1 — Preprocessing
-    # ----------------------------------------------------
+    
     def preprocess(self, text: str) -> List[str]:
         
-        # remove extra whitespace
+        
         text = text.strip()
 
-        # split on punctuation boundaries
+        
         sentences = re.split(r'(?<=[.!?])\s+', text)
 
-        # return non-empty sentences
+        
         return [s for s in sentences if s.strip()]
 
-    # ----------------------------------------------------
-    # STEP 2 — Claim Extraction
-    # ----------------------------------------------------
+    
     def extract_claims(self, sentences: List[str]) -> List[Dict[str, Any]]:
         
         claims = []
@@ -114,7 +109,7 @@ class SemanticContradictionDetector:
                 explanation="At least one sentence pair shows contradiction."
             )
 
-        # otherwise no contradiction
+        
         return ContradictionResult(
             has_contradiction=False,
             confidence=0.0,
@@ -126,9 +121,7 @@ class SemanticContradictionDetector:
 
 def evaluate(detector: SemanticContradictionDetector,
              test_data: List[Dict]) -> Dict[str, float]:
-    """
-    Evaluate detector performance.
-    """
+  
 
     y_true = []
     y_pred = []
